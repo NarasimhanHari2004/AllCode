@@ -26,31 +26,36 @@ import matplotlib.pyplot as plt
 
 # COMPAT SHIM: deepfilternet 0.5.6 still imports the pre-2.1 torchaudio path
 # `torchaudio.backend.common.AudioMetaData`, but that module was removed from
-# newer torchaudio releases (the class moved to `torchaudio.AudioMetaData`).
-# Without this shim, `from df.enhance import ...` below raises:
-#   ModuleNotFoundError: No module named 'torchaudio.backend'
-# on any torchaudio version that dropped the legacy backend module. Recreating
-# just the tiny bit of the old namespace deepfilternet needs avoids having to
-# pin/downgrade torchaudio in the environment.
+# newer torchaudio releases. On some torchaudio versions the class also never
+# got exposed at the new `torchaudio.AudioMetaData` location either, so there
+# is nothing to borrow from the installed torchaudio at all. Instead of
+# sourcing the class from torchaudio, we define our own minimal stand-in with
+# the same fields deepfilternet expects -- it's used purely as a plain data
+# container (sample_rate/num_frames/num_channels/etc.), not for any
+# torchaudio-internal behavior, so a local dataclass is sufficient.
 import sys
 import types
-import torchaudio
+from dataclasses import dataclass
+
+
+@dataclass
+class _ShimAudioMetaData:
+    sample_rate: int = 0
+    num_frames: int = 0
+    num_channels: int = 0
+    bits_per_sample: int = 0
+    encoding: str = ""
+
 
 if "torchaudio.backend.common" not in sys.modules:
-    try:
-        _target = torchaudio.AudioMetaData
-    except AttributeError as e:
-        raise ImportError(
-            "Could not locate AudioMetaData on this torchaudio install; "
-            "the compatibility shim for deepfilternet needs updating."
-        ) from e
-
     _backend_mod = types.ModuleType("torchaudio.backend")
     _common_mod = types.ModuleType("torchaudio.backend.common")
-    _common_mod.AudioMetaData = _target
+    _common_mod.AudioMetaData = _ShimAudioMetaData
     _backend_mod.common = _common_mod
     sys.modules["torchaudio.backend"] = _backend_mod
     sys.modules["torchaudio.backend.common"] = _common_mod
+
+    import torchaudio
     torchaudio.backend = _backend_mod
 
 from df.enhance import enhance, init_df, load_audio, save_audio
