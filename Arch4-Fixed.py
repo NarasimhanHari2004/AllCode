@@ -27,8 +27,30 @@ from clearvoice import ClearVoice
 import matplotlib
 matplotlib.use('Agg')
 
-def calculate_metrics(noisy_np, clean_np):
-    """Calculates engineering metrics comparing noisy and clean audio arrays."""
+def calculate_metrics(noisy_np, clean_np, sr, frame_ms=20):
+    """
+    Reference-free denoising metrics (no paired clean ground-truth file exists,
+    so nothing here can be a *true* SNR delta or true THD — see notes below).
+
+    - level_change_db: overall RMS power change between noisy input and the
+      denoised output. This is NOT "noise removed" — some of that power change
+      is speech energy the model altered too. Kept as a general strength-of-effect
+      indicator, relabeled to stop implying it isolates noise specifically.
+
+    - snr_improvement_db: previously computed as clean_power / (noisy-clean)_power
+      and mislabeled "improvement" — that's really just an *output* SNR estimate
+      (and it silently assumes the denoised signal is pure speech with zero
+      residual noise, which inflates the number). To get an actual before/after
+      *improvement*, we instead estimate a noise floor independently in the noisy
+      and denoised signals from each one's own quietest short-time frames, turn
+      that into an SNR estimate for each, and report the difference.
+
+    - spectral_flatness: replaces the old "thd_percent". The old formula treated
+      the single loudest FFT bin as "the fundamental" and everything else as
+      "harmonics" — that's only meaningful for a periodic tone, not broadband
+      speech, so it was never really measuring THD. Spectral flatness (0 = tonal,
+      1 = noise-like) is a well-defined, honest stand-in for broadband audio.
+    """
     eps = 1e-10
 
     # Ensure both arrays are completely flat and matched in size
@@ -36,29 +58,32 @@ def calculate_metrics(noisy_np, clean_np):
     noisy_np = noisy_np[:min_len]
     clean_np = clean_np[:min_len]
 
-    # 1. Total Noise Reduction (dB Attenuation)
     power_noisy = np.mean(noisy_np ** 2)
     power_clean = np.mean(clean_np ** 2)
-    noise_reduction_db = 10 * np.log10((power_noisy + eps) / (power_clean + eps))
+    level_change_db = 10 * np.log10((power_noisy + eps) / (power_clean + eps))
 
-    # 2. Estimated Residual Profile (Noisy minus Clean to isolate removed noise)
-    removed_noise = noisy_np - clean_np
-    power_removed = np.mean(removed_noise ** 2)
-    snr_imp_db = 10 * np.log10((power_clean + eps) / (power_removed + eps))
+    def estimate_snr(signal):
+        frame_len = max(1, int(sr * frame_ms / 1000))
+        n_frames = len(signal) // frame_len
+        if n_frames == 0:
+            return 0.0
+        frames = signal[:n_frames * frame_len].reshape(n_frames, frame_len)
+        frame_power = np.mean(frames ** 2, axis=1)
+        noise_floor = np.percentile(frame_power, 10) + eps
+        active_power = np.mean(frame_power) + eps
+        return 10 * np.log10(active_power / noise_floor)
 
-    # 3. Total Harmonic Distortion (THD) of clean output via Fast Fourier Transform
-    fft_clean = np.abs(np.fft.rfft(clean_np))
-    idx_fundamental = np.argmax(fft_clean)
-    fundamental_amp = fft_clean[idx_fundamental]
+    snr_improvement_db = estimate_snr(clean_np) - estimate_snr(noisy_np)
 
-    harmonics_sum = np.sum(fft_clean**2) - (fundamental_amp**2)
-    thd = np.sqrt(max(0, harmonics_sum)) / (fundamental_amp + eps)
-    thd_percentage = min(thd * 100, 100.0)
+    fft_clean = np.abs(np.fft.rfft(clean_np)) + eps
+    geo_mean = np.exp(np.mean(np.log(fft_clean)))
+    arith_mean = np.mean(fft_clean)
+    spectral_flatness = float(geo_mean / arith_mean)
 
     return {
-        "noise_reduction_db": noise_reduction_db,
-        "snr_improvement_db": snr_imp_db,
-        "thd_percent": thd_percentage
+        "level_change_db": level_change_db,
+        "snr_improvement_db": snr_improvement_db,
+        "spectral_flatness": spectral_flatness,
     }
 
 def save_and_show_plots(noisy_np, clean_np, sr, plot_path, metrics):
@@ -109,9 +134,9 @@ def save_and_show_plots(noisy_np, clean_np, sr, plot_path, metrics):
     text_str = (
         f"PERFORMANCE SUMMARY METRICS (ARCHITECTURE-4 - TIME-FREQUENCY DOMAIN):\n"
         f"----------------------------------------------------------------------\n"
-        f"• Broad Noise Attenuation: {metrics['noise_reduction_db']:.2f} dB\n"
+        f"• Overall Level Change: {metrics['level_change_db']:.2f} dB\n"
         f"• Estimated SNR Improvement: {metrics['snr_improvement_db']:.2f} dB\n"
-        f"• Total Harmonic Distortion (THD): {metrics['thd_percent']:.2f}%\n"
+        f"• Spectral Flatness (denoised): {metrics['spectral_flatness']:.3f}\n"
     )
     plt.text(0.05, 0.3, text_str, fontsize=13, family='monospace',
              bbox=dict(facecolor='lightgray', alpha=0.5, boxstyle='round,pad=1'))
@@ -153,10 +178,10 @@ def process_file(engine, target_sr, in_path, out_path):
         print(f"[INFO] -> Saved Clean Audio File: {out_path} (Inference took: {t1 - t0:.2f}s)")
 
         # Calculate diagnostics
-        metrics = calculate_metrics(noisy_signal, clean_signal)
-        print(f"       [METRIC] Noise Reduction: {metrics['noise_reduction_db']:.2f} dB")
-        print(f"       [METRIC] SNR Gain: {metrics['snr_improvement_db']:.2f} dB")
-        print(f"       [METRIC] Output THD: {metrics['thd_percent']:.2f}%")
+        metrics = calculate_metrics(noisy_signal, clean_signal, target_sr)
+        print(f"       [METRIC] Overall Level Change: {metrics['level_change_db']:.2f} dB")
+        print(f"       [METRIC] Est. SNR Improvement: {metrics['snr_improvement_db']:.2f} dB")
+        print(f"       [METRIC] Spectral Flatness: {metrics['spectral_flatness']:.3f}")
 
         # Explicitly convert path objects into strict string targets before extending text names
         base_name, _ = os.path.splitext(out_path)
