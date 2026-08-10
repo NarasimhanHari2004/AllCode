@@ -16,48 +16,53 @@ import os
 import time
 import glob
 import librosa
-import librosa.display  # FIX: required explicitly — librosa.display.specshow()
-                         # is not guaranteed to be available just from `import librosa`.
-                         # Without this the script crashes with AttributeError right
-                         # at the plotting step. Same recurring bug as Architecture-1/2/3/4.
+import librosa.display  # Explicitly imported to prevent layout specshow crashes
 import soundfile as sf
 import numpy as np
 import matplotlib.pyplot as plt
-
-# COMPAT SHIM: deepfilternet 0.5.6 still imports the pre-2.1 torchaudio path
-# `torchaudio.backend.common.AudioMetaData`, but that module was removed from
-# newer torchaudio releases. On some torchaudio versions the class also never
-# got exposed at the new `torchaudio.AudioMetaData` location either, so there
-# is nothing to borrow from the installed torchaudio at all. Instead of
-# sourcing the class from torchaudio, we define our own minimal stand-in with
-# the same fields deepfilternet expects -- it's used purely as a plain data
-# container (sample_rate/num_frames/num_channels/etc.), not for any
-# torchaudio-internal behavior, so a local dataclass is sufficient.
 import sys
 import types
-from dataclasses import dataclass
+import subprocess
 
+# ==============================================================================
+# SUBPROCESS SHIM: Safely catch and bypass all internal Git lookup crashes
+# ==============================================================================
+_original_check_output = subprocess.check_output
 
-@dataclass
-class _ShimAudioMetaData:
-    sample_rate: int = 0
-    num_frames: int = 0
-    num_channels: int = 0
-    bits_per_sample: int = 0
-    encoding: str = ""
+def _patched_check_output(*args, **kwargs):
+    cmd_args = args[0] if args else kwargs.get("args", [])
+    # If any underlying dependency attempts to run a git status check, intercept it
+    if len(cmd_args) > 0 and "git" in str(cmd_args[0]).lower():
+        return b"unknown"
+    return _original_check_output(*args, **kwargs)
 
+subprocess.check_output = _patched_check_output
 
-if "torchaudio.backend.common" not in sys.modules:
-    _backend_mod = types.ModuleType("torchaudio.backend")
-    _common_mod = types.ModuleType("torchaudio.backend.common")
-    _common_mod.AudioMetaData = _ShimAudioMetaData
-    _backend_mod.common = _common_mod
-    sys.modules["torchaudio.backend"] = _backend_mod
-    sys.modules["torchaudio.backend.common"] = _common_mod
+# ==============================================================================
+# COMPAT SHIM: Robust patch for deepfilternet 0.5.6 + modern torchaudio (2.9+)
+# ==============================================================================
+import torchaudio
 
-    import torchaudio
-    torchaudio.backend = _backend_mod
+class MockAudioMetaData:
+    def __init__(self, sample_rate: int, num_frames: int, num_channels: int, bits_per_sample: int = 0, encoding: str = ""):
+        self.sample_rate = sample_rate
+        self.num_frames = num_frames
+        self.num_channels = num_channels
+        self.bits_per_sample = bits_per_sample
+        self.encoding = encoding
 
+_backend_mod = types.ModuleType("torchaudio.backend")
+_common_mod = types.ModuleType("torchaudio.backend.common")
+_common_mod.AudioMetaData = MockAudioMetaData
+_backend_mod.common = _common_mod
+
+sys.modules["torchaudio.backend"] = _backend_mod
+sys.modules["torchaudio.backend.common"] = _common_mod
+torchaudio.backend = _backend_mod
+
+# ==============================================================================
+# SAFE EXTENSION IMPORTS: Now safe to import without triggering system crashes
+# ==============================================================================
 from df.enhance import enhance, init_df, load_audio, save_audio
 
 # Force a non-interactive file-writing engine so it never relies on broken window popups
@@ -65,12 +70,18 @@ import matplotlib
 matplotlib.use('Agg')
 
 AUDIO_EXTENSIONS = (".wav", ".flac", ".mp3", ".ogg", ".m4a")
-
-
 def load_model():
     """Loads the pretrained DeepFilterNet3 model + its internal DF state config."""
     print("[INFO] Loading DeepFilterNet3 model weights...")
+    
+    # FIX: Explicitly override DeepFilterNet's internal fallback attribute 
+    # to bypass the corrupted config file lookup reading '7670'
+    import df.enhance
+    df.enhance.DEFAULT_MODEL = "deepfilternet3"
+    
+    # Run initialization normally without passing a broken directory argument
     model, df_state, _ = init_df()
+    
     print(f"[INFO] Model ready. Internal processing sample rate: {df_state.sr()} Hz")
     return model, df_state
 
@@ -124,12 +135,11 @@ def calculate_metrics(noisy_np, clean_np, sr, frame_ms=20):
     spectral_flatness = float(geo_mean / arith_mean)
 
     return {
+        "value_change_db": level_change_db,  # map key explicitly to avoid downstream mismatches
         "level_change_db": level_change_db,
         "snr_improvement_db": snr_improvement_db,
         "spectral_flatness": spectral_flatness,
     }
-
-
 def save_and_show_plots(noisy_np, clean_np, sr, plot_path, metrics):
     """Generates visualization dashboard panel and writes it directly to disk storage."""
     plt.close('all')
@@ -196,69 +206,67 @@ def process_file(model, df_state, in_path, out_path):
     try:
         model_sr = df_state.sr()
 
-        # DeepFilterNet's own loader resamples to the model's native rate for inference.
+        # DeepFilterNet handles internal resampling up to its 48kHz core speed natively
         noisy_audio, _ = load_audio(in_path, sr=model_sr)
 
-        # Keep a librosa-loaded copy at the same rate purely for the "before" side of
-        # the metrics/plots, so both signals are directly comparable sample-for-sample.
-        noisy_np, _ = librosa.load(in_path, sr=model_sr)
-
-        t0 = time.time()
+        # Core audio enhancement step
         enhanced_audio = enhance(model, df_state, noisy_audio)
-        t1 = time.time()
 
-        dur = noisy_audio.shape[-1] / model_sr
-        print(f"[INFO] Track Length: {dur:.1f} seconds")
+        # Save enhanced audio array back to disk storage
+        save_audio(out_path, enhanced_audio, sr=model_sr)
+        print(f"[INFO] -> Enhanced Audio Saved: {out_path}")
 
-        os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
-
-        save_audio(out_path, enhanced_audio, model_sr)
-        print(f"[INFO] -> Saved Clean File: {out_path} (Inference took: {t1 - t0:.2f}s)")
-
-        clean_np = enhanced_audio.squeeze(0).numpy() if hasattr(enhanced_audio, "numpy") else np.asarray(enhanced_audio).squeeze()
+        # Convert back to standard numpy vectors for metrics processing and plotting
+        noisy_np, _ = librosa.load(in_path, sr=model_sr)
+        clean_np, _ = librosa.load(out_path, sr=model_sr)
 
         metrics = calculate_metrics(noisy_np, clean_np, model_sr)
-        print(f"       [METRIC] Overall Level Change: {metrics['level_change_db']:.2f} dB")
-        print(f"       [METRIC] Est. SNR Improvement: {metrics['snr_improvement_db']:.2f} dB")
-        print(f"       [METRIC] Spectral Flatness: {metrics['spectral_flatness']:.3f}")
-
-        base_name, _ = os.path.splitext(out_path)
-        plot_path = os.path.abspath(str(base_name) + "_architecture5_metrics.png")
+        
+        plot_path = os.path.splitext(out_path)[0] + "_dashboard.png"
         save_and_show_plots(noisy_np, clean_np, model_sr, plot_path, metrics)
 
     except Exception as e:
-        print(f"[ERROR] Failed to process {in_path}: {str(e)}")
+        print(f"[ERROR] Failed processing {in_path}: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="DeepFilterNet3 Local Audio Denoiser.")
-    parser.add_argument("--input", "-i", default="test_input.wav", help="Path to a noisy audio file")
-    parser.add_argument("--output", "-o", default="cleaned_output_dfn3_clean.wav", help="Path to save the cleaned audio file")
-    parser.add_argument("--batch", action="store_true", help="Batch mode")
+    parser = argparse.ArgumentParser(description="DeepFilterNet3 Audio Enhancement Suite")
+    parser.add_argument("--input", required=True, help="Path to input noisy file or directory")
+    parser.add_argument("--output", required=True, help="Path to write clean file or output directory")
     args = parser.parse_args()
+
+    if not os.path.exists(args.input):
+        print(f"[ERROR] Input target path does not exist: {args.input}")
+        return
 
     model, df_state = load_model()
 
-    if args.batch:
-        if not os.path.isdir(args.input):
-            print(f"[ERROR] Batch mode active but input folder not found: {args.input}")
-            return
-        files = [f for f in glob.glob(os.path.join(args.input, "*")) if f.lower().endswith(AUDIO_EXTENSIONS)]
-        if not files:
-            print(f"[ERROR] No compatible audio files found in {args.input}")
-            return
+    # Route processing directories vs single targeting modes
+    if os.path.isdir(args.input):
         os.makedirs(args.output, exist_ok=True)
-        for f in files:
-            out_name = os.path.splitext(os.path.basename(f))[0] + "_dfn3_clean.wav"
-            process_file(model, df_state, f, os.path.join(args.output, out_name))
-    else:
-        if not os.path.isfile(args.input):
-            print(f"[ERROR] Input file not found: {args.input}. Make sure 'test_input.wav' is in your Metrics folder!")
+        files = []
+        for ext in AUDIO_EXTENSIONS:
+            files.extend(glob.glob(os.path.join(args.input, f"*{ext}")))
+            files.extend(glob.glob(os.path.join(args.input, f"*{ext.upper()}")))
+        
+        if not files:
+            print(f"[WARN] No matching audio files found inside: {args.input}")
             return
+            
+        print(f"[INFO] Batch mode activated. Discovered {len(files)} files to denoise.")
+        for f in files:
+            base = os.path.basename(f)
+            out_f = os.path.join(args.output, base)
+            process_file(model, df_state, f, out_f)
+    else:
+        out_dir = os.path.dirname(args.output)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
         process_file(model, df_state, args.input, args.output)
 
-    print("\n[DONE] All processing complete.")
-    input("\nPress ENTER to close the terminal window...")
+    print("\n[INFO] Denoising lifecycle operations complete.")
 
 
 if __name__ == "__main__":
