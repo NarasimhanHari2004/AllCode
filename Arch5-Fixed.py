@@ -24,6 +24,35 @@ import soundfile as sf
 import numpy as np
 import matplotlib.pyplot as plt
 
+# COMPAT SHIM: deepfilternet 0.5.6 still imports the pre-2.1 torchaudio path
+# `torchaudio.backend.common.AudioMetaData`, but that module was removed from
+# newer torchaudio releases (the class moved to `torchaudio.AudioMetaData`).
+# Without this shim, `from df.enhance import ...` below raises:
+#   ModuleNotFoundError: No module named 'torchaudio.backend'
+# on any torchaudio version that dropped the legacy backend module. Recreating
+# just the tiny bit of the old namespace deepfilternet needs avoids having to
+# pin/downgrade torchaudio in the environment.
+import sys
+import types
+import torchaudio
+
+if "torchaudio.backend.common" not in sys.modules:
+    try:
+        _target = torchaudio.AudioMetaData
+    except AttributeError as e:
+        raise ImportError(
+            "Could not locate AudioMetaData on this torchaudio install; "
+            "the compatibility shim for deepfilternet needs updating."
+        ) from e
+
+    _backend_mod = types.ModuleType("torchaudio.backend")
+    _common_mod = types.ModuleType("torchaudio.backend.common")
+    _common_mod.AudioMetaData = _target
+    _backend_mod.common = _common_mod
+    sys.modules["torchaudio.backend"] = _backend_mod
+    sys.modules["torchaudio.backend.common"] = _common_mod
+    torchaudio.backend = _backend_mod
+
 from df.enhance import enhance, init_df, load_audio, save_audio
 
 # Force a non-interactive file-writing engine so it never relies on broken window popups
