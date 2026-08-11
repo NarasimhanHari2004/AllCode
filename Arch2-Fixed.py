@@ -4,6 +4,10 @@ Advanced Overlap-Add VRAM-Optimized Audio Denoiser with ANC Diagnostics
 ======================================================================
 Architecture-2: Uses an Overlap-Add (OLA) crossfade architecture to process
 audio in overlapping windows.
+
+FIX APPLIED: level_change_db sign was inverted (was noisy/clean instead of
+clean/noisy), which made a QUIETER output read as a POSITIVE dB number.
+See the "FIX:" comment inside calculate_metrics() below.
 """
 
 import sys
@@ -155,8 +159,10 @@ def calculate_metrics(noisy_np, clean_np, sr, frame_ms=20):
     so nothing here can be a *true* SNR delta or true THD — see notes below).
 
     - level_change_db: overall RMS power change between noisy input and the
-      denoised output. This is NOT "noise removed" — some of that power change
-      is speech energy the model altered too. Kept as a general strength-of-effect
+      denoised output, expressed as output-relative-to-input (standard dB
+      convention: positive = output got LOUDER, negative = output got
+      QUIETER). This is NOT "noise removed" — some of that power change is
+      speech energy the model altered too. Kept as a general strength-of-effect
       indicator, relabeled to stop implying it isolates noise specifically.
 
     - snr_improvement_db: previously computed as clean_power / (noisy-clean)_power
@@ -181,7 +187,12 @@ def calculate_metrics(noisy_np, clean_np, sr, frame_ms=20):
 
     power_noisy = np.mean(noisy_np ** 2)
     power_clean = np.mean(clean_np ** 2)
-    level_change_db = 10 * np.log10((power_noisy + eps) / (power_clean + eps))
+    # FIX: was (power_noisy / power_clean) — that reads QUIETER output as a
+    # POSITIVE number, which is backwards from the standard "output relative
+    # to input" dB convention. Flipped to clean/noisy so:
+    #   positive dB = output louder than input
+    #   negative dB = output quieter than input
+    level_change_db = 10 * np.log10((power_clean + eps) / (power_noisy + eps))
 
     def estimate_snr(signal):
         frame_len = max(1, int(sr * frame_ms / 1000))
