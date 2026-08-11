@@ -4,6 +4,14 @@ Visual Studio Tailored Speech Denoising Script
 =============================================
 Optimized for Microsoft Visual Studio (Purple Logo).
 Calculates ANC metrics and handles plot rendering safely within the IDE.
+
+FIXES APPLIED (see inline "FIX:" comments for details):
+  1. level_change_db sign was inverted (was noisy/clean instead of clean/noisy),
+     which made a QUIETER output read as a POSITIVE dB number.
+  2. plt.show() was unconditional, which hangs --batch mode waiting for a
+     window close after every single file. Now only shown in single-file mode.
+  3. plt.show() wrapped in try/except in case no interactive backend is
+     actually available (TkAgg failed to load silently at import time).
 """
 
 import sys
@@ -115,8 +123,10 @@ def calculate_metrics(noisy_np, clean_np, sr, frame_ms=20):
     so nothing here can be a *true* SNR delta or true THD — see notes below).
 
     - level_change_db: overall RMS power change between noisy input and the
-      denoised output. This is NOT "noise removed" — some of that power change
-      is speech energy the model altered too. Kept as a general strength-of-effect
+      denoised output, expressed as output-relative-to-input (standard dB
+      convention: positive = output got LOUDER, negative = output got
+      QUIETER). This is NOT "noise removed" — some of that power change is
+      speech energy the model altered too. Kept as a general strength-of-effect
       indicator, relabeled to stop implying it isolates noise specifically.
 
     - snr_improvement_db: previously computed as clean_power / (noisy-clean)_power
@@ -141,7 +151,13 @@ def calculate_metrics(noisy_np, clean_np, sr, frame_ms=20):
 
     power_noisy = np.mean(noisy_np ** 2)
     power_clean = np.mean(clean_np ** 2)
-    level_change_db = 10 * np.log10((power_noisy + eps) / (power_clean + eps))
+    # FIX: was (power_noisy / power_clean) — that reads QUIETER output as a
+    # POSITIVE number, which is backwards from the standard "output relative
+    # to input" dB convention used everywhere else in this codebase's docs
+    # and in normal audio engineering. Flipped to clean/noisy so:
+    #   positive dB = output louder than input
+    #   negative dB = output quieter than input
+    level_change_db = 10 * np.log10((power_clean + eps) / (power_noisy + eps))
 
     def estimate_snr(signal):
         frame_len = max(1, int(sr * frame_ms / 1000))
@@ -167,7 +183,7 @@ def calculate_metrics(noisy_np, clean_np, sr, frame_ms=20):
         "spectral_flatness": spectral_flatness,
     }
 
-def save_and_show_plots(noisy_np, clean_np, sr, plot_path, metrics):
+def save_and_show_plots(noisy_np, clean_np, sr, plot_path, metrics, interactive=True):
     plt.close('all')
 
     fig = plt.figure(figsize=(14, 9))
@@ -215,10 +231,18 @@ def save_and_show_plots(noisy_np, clean_np, sr, plot_path, metrics):
     plt.savefig(plot_path, dpi=150)
     print(f"[INFO] -> Metrics Dashboard Saved: {plot_path}")
 
-    print("[INFO] Displaying interactive plot window. Close it to proceed.")
-    plt.show()
+    # FIX: plt.show() used to run unconditionally, which blocks --batch mode
+    # after EVERY file waiting for the window to be closed manually. Now only
+    # shown in single-file (interactive) mode, and wrapped in try/except in
+    # case TkAgg silently failed to load and the active backend can't show().
+    if interactive:
+        print("[INFO] Displaying interactive plot window. Close it to proceed.")
+        try:
+            plt.show()
+        except Exception as e:
+            print(f"[WARN] Could not display interactive plot window: {str(e)}")
 
-def process_file(model, device, target_sr, in_path, out_path):
+def process_file(model, device, target_sr, in_path, out_path, interactive=True):
     print(f"\n[INFO] Processing: {in_path}")
     try:
         wav = load_audio(in_path, target_sr)
@@ -243,7 +267,7 @@ def process_file(model, device, target_sr, in_path, out_path):
         print(f"       [METRIC] Spectral Flatness: {metrics['spectral_flatness']:.3f}")
 
         plot_path = os.path.splitext(out_path)[0] + "_metrics.png"
-        save_and_show_plots(noisy_np, clean_np, target_sr, plot_path, metrics)
+        save_and_show_plots(noisy_np, clean_np, target_sr, plot_path, metrics, interactive=interactive)
 
     except Exception as e:
         print(f"[ERROR] Failed to process {in_path}: {str(e)}")
@@ -261,6 +285,10 @@ def main():
     model = load_model(args.model, device)
     target_sr = model.sample_rate
 
+    # FIX: thread the batch flag through so plot windows don't block a
+    # multi-file run waiting to be closed by hand.
+    interactive = not args.batch
+
     if args.batch:
         if not os.path.isdir(args.input):
             print(f"[ERROR] Batch mode active but input folder not found: {args.input}")
@@ -272,12 +300,12 @@ def main():
         os.makedirs(args.output, exist_ok=True)
         for f in files:
             out_name = os.path.splitext(os.path.basename(f))[0] + "_clean.wav"
-            process_file(model, device, target_sr, f, os.path.join(args.output, out_name))
+            process_file(model, device, target_sr, f, os.path.join(args.output, out_name), interactive=interactive)
     else:
         if not os.path.isfile(args.input):
             print(f"[ERROR] Input file not found: {args.input}. Make sure 'test_input.wav' is in your Metrics folder!")
             return
-        process_file(model, device, target_sr, args.input, args.output)
+        process_file(model, device, target_sr, args.input, args.output, interactive=interactive)
 
     print("\n[DONE] All processing complete.")
     input("\nPress ENTER to close the terminal window...")
