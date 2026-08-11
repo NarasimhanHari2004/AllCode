@@ -229,7 +229,53 @@ def calculate_metrics(noisy_np, clean_np, sr, frame_ms=20):
     }
 
 
-def save_and_show_plots(noisy_np, clean_np, sr, plot_path, metrics):
+def calculate_perceptual_metrics(reference_np, degraded_np, sr):
+    """
+    PESQ (ITU-T P.862) and STOI need an actual clean reference recording —
+    unlike the three metrics above, they are NOT reference-free. Only call
+    this when a real clean file was supplied via --reference; faking a score
+    against the noisy input instead would not be a valid use of either metric.
+
+    - PESQ: perceptual quality score, roughly -0.5 to 4.5 (higher = closer
+      to the reference). Requires 8 kHz (narrowband) or 16 kHz (wideband)
+      audio; anything else is resampled to 16 kHz first.
+    - STOI: short-time objective intelligibility, 0 to 1 (higher = more
+      intelligible relative to the reference).
+    """
+    from pesq import pesq
+    from pystoi import stoi
+
+    min_len = min(len(reference_np), len(degraded_np))
+    reference_np = reference_np[:min_len].astype(np.float32)
+    degraded_np = degraded_np[:min_len].astype(np.float32)
+
+    if sr not in (8000, 16000):
+        eval_sr = 16000
+        reference_eval = librosa.resample(reference_np, orig_sr=sr, target_sr=eval_sr)
+        degraded_eval = librosa.resample(degraded_np, orig_sr=sr, target_sr=eval_sr)
+    else:
+        eval_sr = sr
+        reference_eval = reference_np
+        degraded_eval = degraded_np
+
+    pesq_mode = 'wb' if eval_sr == 16000 else 'nb'
+
+    try:
+        pesq_score = float(pesq(eval_sr, reference_eval, degraded_eval, pesq_mode))
+    except Exception as e:
+        print(f"[WARN] PESQ computation failed: {e}")
+        pesq_score = None
+
+    try:
+        stoi_score = float(stoi(reference_np, degraded_np, sr, extended=False))
+    except Exception as e:
+        print(f"[WARN] STOI computation failed: {e}")
+        stoi_score = None
+
+    return {"pesq": pesq_score, "stoi": stoi_score}
+
+
+def save_and_show_plots(noisy_np, clean_np, sr, plot_path, metrics, perceptual=None):
     """Generates visualization dashboard panel and writes it directly to disk storage."""
     plt.close('all')
 
@@ -276,6 +322,15 @@ def save_and_show_plots(noisy_np, clean_np, sr, plot_path, metrics):
         f"• Estimated SNR Improvement: {metrics['snr_improvement_db']:.2f} dB\n"
         f"• Spectral Flatness (denoised): {metrics['spectral_flatness']:.3f}\n"
     )
+    if perceptual is not None:
+        pesq_str = f"{perceptual['pesq']:.3f}" if perceptual['pesq'] is not None else "N/A"
+        stoi_str = f"{perceptual['stoi']:.3f}" if perceptual['stoi'] is not None else "N/A"
+        text_str += (
+            f"• PESQ (vs. reference): {pesq_str}\n"
+            f"• STOI (vs. reference): {stoi_str}\n"
+        )
+    else:
+        text_str += "• PESQ/STOI: skipped (no --reference clean file supplied)\n"
     plt.text(0.05, 0.3, text_str, fontsize=13, family='monospace',
              bbox=dict(facecolor='lightgray', alpha=0.5, boxstyle='round,pad=1'))
 
@@ -291,7 +346,7 @@ def save_and_show_plots(noisy_np, clean_np, sr, plot_path, metrics):
     except Exception as e:
         print(f"[WARN] Script couldn't open image viewer automatically: {str(e)}")
 
-def process_file(model, device, target_sr, in_path, out_path):
+def process_file(model, device, target_sr, in_path, out_path, reference_path=None):
     """Orchestrates individual file lifecycles with advanced artifact suppression."""
     print(f"\n[INFO] Processing: {in_path}")
     try:
@@ -332,12 +387,26 @@ def process_file(model, device, target_sr, in_path, out_path):
         print(f"       [METRIC] Est. SNR Improvement: {metrics['snr_improvement_db']:.2f} dB")
         print(f"       [METRIC] Spectral Flatness: {metrics['spectral_flatness']:.3f}")
 
+        perceptual = None
+        if reference_path:
+            if os.path.isfile(reference_path):
+                ref_np = load_audio(reference_path, target_sr).squeeze(0).numpy()
+                perceptual = calculate_perceptual_metrics(ref_np, final_blend, target_sr)
+                p_str = f"{perceptual['pesq']:.3f}" if perceptual['pesq'] is not None else "N/A"
+                s_str = f"{perceptual['stoi']:.3f}" if perceptual['stoi'] is not None else "N/A"
+                print(f"       [METRIC] PESQ (vs. reference): {p_str}")
+                print(f"       [METRIC] STOI (vs. reference): {s_str}")
+            else:
+                print(f"[WARN] --reference file not found: {reference_path}. Skipping PESQ/STOI.")
+        else:
+            print("       [METRIC] PESQ/STOI: skipped (no --reference clean file supplied)")
+
         # FIX: Force base path into a strict string format before appending extension text
         base_name, _ = os.path.splitext(out_path)
         plot_path = os.path.abspath(str(base_name) + "_architecture3_metrics.png")
 
         # Run visualization dashboard pipeline
-        save_and_show_plots(noisy_np, final_blend, target_sr, plot_path, metrics)
+        save_and_show_plots(noisy_np, final_blend, target_sr, plot_path, metrics, perceptual=perceptual)
 
     except Exception as e:
         print(f"[ERROR] Failed to process {in_path}: {str(e)}")
@@ -351,6 +420,9 @@ def main():
     parser.add_argument("--output", "-o", default="cleaned_output_blend_clean.wav", help="Path to save the cleaned audio file")
     parser.add_argument("--model", "-m", default="dns48", choices=["dns64", "dns48", "master64"])
     parser.add_argument("--batch", action="store_true", help="Batch mode")
+    parser.add_argument("--reference", "-r", default=None,
+                         help="Path to a genuine CLEAN reference file (not the noisy input). "
+                              "Required to compute PESQ/STOI; if omitted, those two metrics are skipped.")
     args = parser.parse_args()
 
     device = get_device()
@@ -369,13 +441,13 @@ def main():
             # which raises TypeError: can only concatenate tuple (not "str") to tuple.
             # Need to take [0] (the root) before concatenating, same as the other scripts.
             out_name = os.path.splitext(os.path.basename(f))[0] + "_architecture3_clean.wav"
-            process_file(model, device, target_sr, f, os.path.join(args.output, out_name))
+            process_file(model, device, target_sr, f, os.path.join(args.output, out_name), reference_path=args.reference)
     else:
         if not os.path.isfile(args.input):
             print(f"[ERROR] Input file not found: {args.input}. Make sure 'test_input.wav' is in your Metrics folder!")
             return
 
-        process_file(model, device, target_sr, args.input, args.output)
+        process_file(model, device, target_sr, args.input, args.output, reference_path=args.reference)
 
     print("\n[DONE] All processing complete.")
     input("\nPress ENTER to close the terminal window...")
