@@ -7,6 +7,14 @@ to enhance noisy speech inside 2D spectrogram matrices.
 
 Optimized for Microsoft Visual Studio. Computes ANC performance metrics and
 automatically opens the integrated Architecture-4 dashboard figure.
+
+FIXES APPLIED (see inline "FIX:" comments for details):
+  1. level_change_db sign was inverted (was noisy/clean instead of
+     clean/noisy), which made a QUIETER output read as a POSITIVE dB number.
+  2. engine(...) output handling assumed a bare ndarray with .ndim. ClearVoice
+     can return a dict (keyed by model name) when it's configured with
+     multiple models, which would previously crash with AttributeError.
+     Also coerces list/tuple returns into an ndarray defensively.
 """
 
 import argparse
@@ -33,8 +41,10 @@ def calculate_metrics(noisy_np, clean_np, sr, frame_ms=20):
     so nothing here can be a *true* SNR delta or true THD — see notes below).
 
     - level_change_db: overall RMS power change between noisy input and the
-      denoised output. This is NOT "noise removed" — some of that power change
-      is speech energy the model altered too. Kept as a general strength-of-effect
+      denoised output, expressed as output-relative-to-input (standard dB
+      convention: positive = output got LOUDER, negative = output got
+      QUIETER). This is NOT "noise removed" — some of that power change is
+      speech energy the model altered too. Kept as a general strength-of-effect
       indicator, relabeled to stop implying it isolates noise specifically.
 
     - snr_improvement_db: previously computed as clean_power / (noisy-clean)_power
@@ -60,7 +70,12 @@ def calculate_metrics(noisy_np, clean_np, sr, frame_ms=20):
 
     power_noisy = np.mean(noisy_np ** 2)
     power_clean = np.mean(clean_np ** 2)
-    level_change_db = 10 * np.log10((power_noisy + eps) / (power_clean + eps))
+    # FIX: was (power_noisy / power_clean) — that reads QUIETER output as a
+    # POSITIVE number, which is backwards from the standard "output relative
+    # to input" dB convention. Flipped to clean/noisy so:
+    #   positive dB = output louder than input
+    #   negative dB = output quieter than input
+    level_change_db = 10 * np.log10((power_clean + eps) / (power_noisy + eps))
 
     def estimate_snr(signal):
         frame_len = max(1, int(sr * frame_ms / 1000))
@@ -86,7 +101,52 @@ def calculate_metrics(noisy_np, clean_np, sr, frame_ms=20):
         "spectral_flatness": spectral_flatness,
     }
 
-def save_and_show_plots(noisy_np, clean_np, sr, plot_path, metrics):
+def calculate_perceptual_metrics(reference_np, degraded_np, sr):
+    """
+    PESQ (ITU-T P.862) and STOI need an actual clean reference recording —
+    unlike the three metrics above, they are NOT reference-free. Only call
+    this when a real clean file was supplied via --reference; faking a score
+    against the noisy input instead would not be a valid use of either metric.
+
+    - PESQ: perceptual quality score, roughly -0.5 to 4.5 (higher = closer
+      to the reference). Requires 8 kHz (narrowband) or 16 kHz (wideband)
+      audio; anything else is resampled to 16 kHz first.
+    - STOI: short-time objective intelligibility, 0 to 1 (higher = more
+      intelligible relative to the reference).
+    """
+    from pesq import pesq
+    from pystoi import stoi
+
+    min_len = min(len(reference_np), len(degraded_np))
+    reference_np = reference_np[:min_len].astype(np.float32)
+    degraded_np = degraded_np[:min_len].astype(np.float32)
+
+    if sr not in (8000, 16000):
+        eval_sr = 16000
+        reference_eval = librosa.resample(reference_np, orig_sr=sr, target_sr=eval_sr)
+        degraded_eval = librosa.resample(degraded_np, orig_sr=sr, target_sr=eval_sr)
+    else:
+        eval_sr = sr
+        reference_eval = reference_np
+        degraded_eval = degraded_np
+
+    pesq_mode = 'wb' if eval_sr == 16000 else 'nb'
+
+    try:
+        pesq_score = float(pesq(eval_sr, reference_eval, degraded_eval, pesq_mode))
+    except Exception as e:
+        print(f"[WARN] PESQ computation failed: {e}")
+        pesq_score = None
+
+    try:
+        stoi_score = float(stoi(reference_np, degraded_np, sr, extended=False))
+    except Exception as e:
+        print(f"[WARN] STOI computation failed: {e}")
+        stoi_score = None
+
+    return {"pesq": pesq_score, "stoi": stoi_score}
+
+def save_and_show_plots(noisy_np, clean_np, sr, plot_path, metrics, perceptual=None):
     """Generates visualization dashboard panel and writes it directly to disk storage."""
     plt.close('all')
 
@@ -138,6 +198,15 @@ def save_and_show_plots(noisy_np, clean_np, sr, plot_path, metrics):
         f"• Estimated SNR Improvement: {metrics['snr_improvement_db']:.2f} dB\n"
         f"• Spectral Flatness (denoised): {metrics['spectral_flatness']:.3f}\n"
     )
+    if perceptual is not None:
+        pesq_str = f"{perceptual['pesq']:.3f}" if perceptual['pesq'] is not None else "N/A"
+        stoi_str = f"{perceptual['stoi']:.3f}" if perceptual['stoi'] is not None else "N/A"
+        text_str += (
+            f"• PESQ (vs. reference): {pesq_str}\n"
+            f"• STOI (vs. reference): {stoi_str}\n"
+        )
+    else:
+        text_str += "• PESQ/STOI: skipped (no --reference clean file supplied)\n"
     plt.text(0.05, 0.3, text_str, fontsize=13, family='monospace',
              bbox=dict(facecolor='lightgray', alpha=0.5, boxstyle='round,pad=1'))
 
@@ -153,7 +222,7 @@ def save_and_show_plots(noisy_np, clean_np, sr, plot_path, metrics):
     except Exception as e:
         print(f"[WARN] Script couldn't open image viewer automatically: {str(e)}")
 
-def process_file(engine, target_sr, in_path, out_path):
+def process_file(engine, target_sr, in_path, out_path, reference_path=None):
     """Orchestrates individual file lifecycles with advanced diagnostics."""
     print(f"\n[INFO] Processing: {in_path}")
     try:
@@ -164,6 +233,16 @@ def process_file(engine, target_sr, in_path, out_path):
         # 1. Execute Time-Frequency Transmutation Engine
         output_array = engine(input_path=in_path, online_write=False)
         t1 = time.time()
+
+        # FIX: ClearVoice's __call__ can return a dict (keyed by model name)
+        # instead of a bare ndarray when the engine was built with multiple
+        # model_names, and could in principle hand back a list/tuple. The
+        # original code called .ndim directly on whatever came back, which
+        # raises AttributeError on anything but a plain ndarray. Normalize
+        # first, then apply the original channel-selection logic.
+        if isinstance(output_array, dict):
+            output_array = next(iter(output_array.values()))
+        output_array = np.asarray(output_array)
 
         # 2. Extract single channel index track structure
         if output_array.ndim > 1:
@@ -183,12 +262,26 @@ def process_file(engine, target_sr, in_path, out_path):
         print(f"       [METRIC] Est. SNR Improvement: {metrics['snr_improvement_db']:.2f} dB")
         print(f"       [METRIC] Spectral Flatness: {metrics['spectral_flatness']:.3f}")
 
+        perceptual = None
+        if reference_path:
+            if os.path.isfile(reference_path):
+                ref_np, _ = librosa.load(reference_path, sr=target_sr)
+                perceptual = calculate_perceptual_metrics(ref_np, clean_signal, target_sr)
+                p_str = f"{perceptual['pesq']:.3f}" if perceptual['pesq'] is not None else "N/A"
+                s_str = f"{perceptual['stoi']:.3f}" if perceptual['stoi'] is not None else "N/A"
+                print(f"       [METRIC] PESQ (vs. reference): {p_str}")
+                print(f"       [METRIC] STOI (vs. reference): {s_str}")
+            else:
+                print(f"[WARN] --reference file not found: {reference_path}. Skipping PESQ/STOI.")
+        else:
+            print("       [METRIC] PESQ/STOI: skipped (no --reference clean file supplied)")
+
         # Explicitly convert path objects into strict string targets before extending text names
         base_name, _ = os.path.splitext(out_path)
         plot_path = os.path.abspath(str(base_name) + "_architecture4_metrics.png")
 
         # Launch visualization panel builders
-        save_and_show_plots(noisy_signal, clean_signal, target_sr, plot_path, metrics)
+        save_and_show_plots(noisy_signal, clean_signal, target_sr, plot_path, metrics, perceptual=perceptual)
 
     except Exception as e:
         print(f"[ERROR] Failed to process {in_path}: {str(e)}")
@@ -198,6 +291,9 @@ def main():
     # Fallbacks protect script execution within Visual Studio isolated environments
     parser.add_argument("--input", "-i", default="test_input.wav", help="Input noisy audio track (.wav)")
     parser.add_argument("--output", "-o", default="cleaned_output_frcrn_clean.wav", help="Output clean audio path (.wav)")
+    parser.add_argument("--reference", "-r", default=None,
+                         help="Path to a genuine CLEAN reference file (not the noisy input). "
+                              "Required to compute PESQ/STOI; if omitted, those two metrics are skipped.")
     args = parser.parse_args()
 
     if not os.path.isfile(args.input):
@@ -210,7 +306,7 @@ def main():
     print("[INFO] Loading FRCRN Time-Frequency Neural Layers to GPU...")
     engine = ClearVoice(task='speech_enhancement', model_names=['FRCRN_SE_16K'])
 
-    process_file(engine, target_sr, args.input, args.output)
+    process_file(engine, target_sr, args.input, args.output, reference_path=args.reference)
 
     print("\n[DONE] All processing complete.")
     input("\nPress ENTER to close the terminal window...")
