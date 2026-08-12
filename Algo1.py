@@ -46,7 +46,12 @@ def load_wav(path: str):
     sr, data = wavfile.read(path)
     orig_dtype = data.dtype
 
-    if np.issubdtype(orig_dtype, np.integer):
+    if orig_dtype == np.uint8:
+        # 8-bit PCM WAV is unsigned with 128 as the zero point (unlike every
+        # other PCM width, which is signed). Handle it explicitly or the
+        # whole signal comes out with a +1.0 DC offset.
+        audio = (data.astype(np.float32) - 128.0) / 128.0
+    elif np.issubdtype(orig_dtype, np.integer):
         max_val = float(np.iinfo(orig_dtype).max)
         audio = data.astype(np.float32) / max_val
     else:
@@ -178,7 +183,7 @@ def spectral_floor_db_to_lin(db: float) -> float:
 
 
 def match_loudness(original: np.ndarray, processed: np.ndarray,
-                    percentile: float = 90.0, max_gain_db: float = 12.0) -> np.ndarray:
+                    percentile: float = 90.0, max_gain_db: float = 6.0) -> np.ndarray:
     """
     Spectral gating inherently reduces overall level (it attenuates the
     noise floor between/under speech, which lowers average energy even
@@ -188,13 +193,21 @@ def match_loudness(original: np.ndarray, processed: np.ndarray,
     This restores perceptual loudness by matching the high-percentile
     ("loud"/speech-dominant) sample energy of the processed signal to that
     of the original, with a capped makeup gain so we never amplify residual
-    noise beyond what's reasonable.
+    noise beyond what's reasonable -- and never clip.
     """
     orig_level = np.percentile(np.abs(original), percentile) + 1e-8
     proc_level = np.percentile(np.abs(processed), percentile) + 1e-8
     gain = orig_level / proc_level
     max_gain = 10 ** (max_gain_db / 20)
     gain = float(np.clip(gain, 1.0 / max_gain, max_gain))
+
+    # Never let the makeup gain push peaks past the original file's own
+    # peak level -- avoids clipping/distortion introduced by this step.
+    proc_peak = np.max(np.abs(processed)) + 1e-8
+    orig_peak = np.max(np.abs(original)) + 1e-8
+    safe_gain = orig_peak / proc_peak
+    gain = min(gain, max(safe_gain, 1.0 / max_gain))
+
     return processed * gain
 
 
@@ -207,6 +220,8 @@ def denoise_wav(
     output_path: str = "denoised_audio.wav",
     strength: float = 0.95,
     noise_clip_path: str | None = None,
+    n_std_thresh: float = 1.4,
+    debug: bool = False,
 ):
     """
     Denoise `input_path` and write the result to `output_path`.
@@ -217,6 +232,12 @@ def denoise_wav(
               recording of room tone / hum with no speech). If provided,
               the noise profile is built from it instead of being
               auto-detected, which gives even more precise results.
+    n_std_thresh: how many standard deviations above the noise floor a
+              bin must be to be treated as signal. LOWER = more aggressive
+              (removes more, risks eating quiet speech). Default 1.4.
+              Try 0.5-1.0 if the default isn't removing enough.
+    debug: print before/after stats so you can verify the algorithm is
+              actually doing something on your specific file.
     """
     audio, sr, dtype = load_wav(input_path)
 
@@ -231,19 +252,39 @@ def denoise_wav(
         if noise_clip.ndim > 1:
             noise_clip = noise_clip.mean(axis=1)
 
+    if debug:
+        dur = len(audio) / sr
+        print(f"[debug] loaded: {input_path}")
+        print(f"[debug]   sample_rate={sr}  duration={dur:.2f}s  "
+              f"channels={'stereo' if audio.ndim > 1 else 'mono'}  "
+              f"orig_dtype={dtype}")
+        print(f"[debug]   input peak={np.max(np.abs(audio)):.4f}  "
+              f"input RMS={np.sqrt(np.mean(audio.astype(np.float64) ** 2)):.4f}")
+
     if audio.ndim == 1:
         clean = denoise_channel(audio, sr, prop_decrease=strength,
-                                 noise_clip=noise_clip)
+                                 n_std_thresh=n_std_thresh, noise_clip=noise_clip)
         clean = match_loudness(audio, clean)
     else:
         # Process each channel independently, preserving stereo image.
         channels = []
         for c in range(audio.shape[1]):
             ch_clean = denoise_channel(audio[:, c], sr, prop_decrease=strength,
-                                        noise_clip=noise_clip)
+                                        n_std_thresh=n_std_thresh, noise_clip=noise_clip)
             ch_clean = match_loudness(audio[:, c], ch_clean)
             channels.append(ch_clean)
         clean = np.stack(channels, axis=1)
+
+    if debug:
+        diff = np.abs(clean.astype(np.float64) - audio.astype(np.float64))
+        print(f"[debug]   output peak={np.max(np.abs(clean)):.4f}  "
+              f"output RMS={np.sqrt(np.mean(clean.astype(np.float64) ** 2)):.4f}")
+        print(f"[debug]   max sample difference={diff.max():.6f}  "
+              f"mean sample difference={diff.mean():.6f}")
+        if diff.max() < 1e-4:
+            print("[debug]   WARNING: output is essentially identical to input. "
+                  "Try a lower --n_std_thresh (e.g. 0.5-0.8) or check the file "
+                  "actually contains a noise floor distinguishable from the signal.")
 
     save_wav(output_path, clean, sr, dtype)
     return output_path
@@ -256,7 +297,12 @@ if __name__ == "__main__":
     p.add_argument("-o", "--output", default="denoised_audio.wav", help="Path to write denoised .wav")
     p.add_argument("-s", "--strength", type=float, default=0.95, help="Denoise strength 0-1 (default 0.95)")
     p.add_argument("-n", "--noise_clip", default=None, help="Optional WAV of noise-only reference")
+    p.add_argument("-t", "--n_std_thresh", type=float, default=1.4,
+                    help="Sensitivity: lower = more aggressive removal (default 1.4, try 0.5-0.8 for more)")
+    p.add_argument("--debug", action="store_true", help="Print before/after diagnostics")
     args = p.parse_args()
 
-    out = denoise_wav(args.input, args.output, strength=args.strength, noise_clip_path=args.noise_clip)
+    out = denoise_wav(args.input, args.output, strength=args.strength,
+                       noise_clip_path=args.noise_clip, n_std_thresh=args.n_std_thresh,
+                       debug=args.debug)
     print(f"Wrote denoised audio to: {out}")
